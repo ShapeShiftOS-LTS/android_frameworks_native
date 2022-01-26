@@ -1502,6 +1502,39 @@ int32_t InputDispatcher::findFocusedWindowTargetsLocked(nsecs_t currentTime,
         return INPUT_EVENT_INJECTION_FAILED;
     }
 
+    // Drop key events if requested by input feature
+    if (focusedWindowHandle != nullptr && shouldDropInput(entry, focusedWindowHandle)) {
+        return INPUT_EVENT_INJECTION_FAILED;
+    }
+
+    // Compatibility behavior: raise ANR if there is a focused application, but no focused window.
+    // Only start counting when we have a focused event to dispatch. The ANR is canceled if we
+    // start interacting with another application via touch (app switch). This code can be removed
+    // if the "no focused window ANR" is moved to the policy. Input doesn't know whether
+    // an app is expected to have a focused window.
+    if (focusedWindowHandle == nullptr && focusedApplicationHandle != nullptr) {
+        if (!mNoFocusedWindowTimeoutTime.has_value()) {
+            // We just discovered that there's no focused window. Start the ANR timer
+            const nsecs_t timeout = focusedApplicationHandle->getDispatchingTimeout(
+                    DEFAULT_INPUT_DISPATCHING_TIMEOUT.count());
+            mNoFocusedWindowTimeoutTime = currentTime + timeout;
+            mAwaitedFocusedApplication = focusedApplicationHandle;
+            ALOGW("Waiting because no window has focus but %s may eventually add a "
+                  "window when it finishes starting up. Will wait for %" PRId64 "ms",
+                  mAwaitedFocusedApplication->getName().c_str(), ns2ms(timeout));
+            *nextWakeupTime = *mNoFocusedWindowTimeoutTime;
+            return INPUT_EVENT_INJECTION_PENDING;
+        } else if (currentTime > *mNoFocusedWindowTimeoutTime) {
+            // Already raised ANR. Drop the event
+            ALOGE("Dropping %s event because there is no focused window",
+                  EventEntry::typeToString(entry.type));
+            return INPUT_EVENT_INJECTION_FAILED;
+        } else {
+            // Still waiting for the focused window
+            return INPUT_EVENT_INJECTION_PENDING;
+        }
+    }
+
     // we have a valid, non-null focused window
     resetNoFocusedWindowTimeoutLocked();
 
@@ -1703,6 +1736,11 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
             }
         }
 
+        // Drop touch events if requested by input feature
+        if (newTouchedWindowHandle != nullptr && shouldDropInput(entry, newTouchedWindowHandle)) {
+            newTouchedWindowHandle = nullptr;
+        }
+
         // Also don't send the new touch event to unresponsive gesture monitors
         newGestureMonitors = selectResponsiveMonitorsLocked(newGestureMonitors);
 
@@ -1767,6 +1805,13 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
                     tempTouchState.getFirstForegroundWindowHandle();
             sp<InputWindowHandle> newTouchedWindowHandle =
                     findTouchedWindowAtLocked(displayId, x, y, &tempTouchState);
+
+            // Drop touch events if requested by input feature
+            if (newTouchedWindowHandle != nullptr &&
+                shouldDropInput(entry, newTouchedWindowHandle)) {
+                newTouchedWindowHandle = nullptr;
+            }
+
             if (oldTouchedWindowHandle != newTouchedWindowHandle &&
                 oldTouchedWindowHandle != nullptr && newTouchedWindowHandle != nullptr) {
                 if (DEBUG_FOCUS) {
@@ -5129,6 +5174,18 @@ bool InputDispatcher::waitForIdle() {
     mLooper->wake();
     std::cv_status result = mDispatcherEnteredIdle.wait_for(lock, TIMEOUT);
     return result == std::cv_status::no_timeout;
+}
+
+bool InputDispatcher::shouldDropInput(const EventEntry& entry,
+                                      const sp<InputWindowHandle>& windowHandle) const {
+    if (windowHandle->getInfo()->inputFeatures & InputWindowInfo::INPUT_FEATURE_DROP_INPUT) {
+        ALOGW("Dropping %s event targeting %s as requested by inputFeatures=0x%08x on display "
+              "%" PRId32 ".",
+              EventEntry::typeToString(entry.type), windowHandle->getName().c_str(),
+              windowHandle->getInfo()->inputFeatures, windowHandle->getInfo()->displayId);
+        return true;
+    }
+    return false;
 }
 
 } // namespace android::inputdispatcher
